@@ -82,6 +82,7 @@ impl Executor {
     }
 
     fn configure_pwr(&mut self) {
+        critical_section::with(|cs| {
         trace!("low power: configure_pwr");
 
         self.scb.clear_sleepdeep();
@@ -97,6 +98,7 @@ impl Executor {
 
         trace!("low power: enter stop...");
         self.scb.set_sleepdeep();
+        });
     }
 
     /// Run the executor.
