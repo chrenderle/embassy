@@ -64,24 +64,34 @@ impl super::Rtc {
     #[cfg(feature = "low-power")]
     /// start the wakeup alarm and wtih a duration that is as close to but less than
     /// the requested duration, and record the instant the wakeup alarm was started
-    pub(crate) fn start_wakeup_alarm(&self, requested_duration: embassy_time::Duration) {
+    pub(crate) fn start_wakeup_alarm(
+        &self,
+        requested_duration: embassy_time::Duration,
+        cs: critical_section::CriticalSection,
+    ) {
         use embassy_time::{Duration, TICK_HZ};
 
+        // Panic if the rcc mod knows we're not using low-power rtc
         #[cfg(any(rcc_wb, rcc_f4, rcc_f410))]
         unsafe { crate::rcc::get_freqs() }.rtc.unwrap();
 
+        /*
+            If the requested duration is u64::MAX, don't even set the alarm
+
+            Otherwise clamp the requested duration to u32::MAX so that we can do math
+        */
+        if requested_duration.as_ticks() == u64::MAX {
+            return;
+        }
+
+        let requested_duration = requested_duration.as_ticks().clamp(0, u32::MAX as u64);
         let rtc_hz = Self::frequency().0 as u64;
-        let rtc_ticks = requested_duration.as_ticks() * rtc_hz / TICK_HZ;
+        let rtc_ticks = requested_duration * rtc_hz / TICK_HZ;
         let prescaler = WakeupPrescaler::compute_min((rtc_ticks / u16::MAX as u64) as u32);
 
         // adjust the rtc ticks to the prescaler and subtract one rtc tick
         let rtc_ticks = rtc_ticks / prescaler as u64;
-        let rtc_ticks = if rtc_ticks >= u16::MAX as u64 {
-            u16::MAX - 1
-        } else {
-            rtc_ticks as u16
-        }
-        .saturating_sub(1);
+        let rtc_ticks = rtc_ticks.clamp(0, (u16::MAX - 1) as u64).saturating_sub(1) as u16;
 
         self.write(false, |regs| {
             regs.cr().modify(|w| w.set_wute(false));
@@ -102,25 +112,13 @@ impl super::Rtc {
             self.instant(),
         );
 
-        critical_section::with(|cs| assert!(self.stop_time.borrow(cs).replace(Some(self.instant())).is_none()))
-    }
-
-    #[cfg(feature = "low-power")]
-    pub(crate) fn enable_wakeup_line(&self) {
-        use crate::interrupt::typelevel::Interrupt;
-        use crate::pac::EXTI;
-
-        <RTC as crate::rtc::sealed::Instance>::WakeupInterrupt::unpend();
-        unsafe { <RTC as crate::rtc::sealed::Instance>::WakeupInterrupt::enable() };
-
-        EXTI.rtsr(0).modify(|w| w.set_line(RTC::EXTI_WAKEUP_LINE, true));
-        EXTI.imr(0).modify(|w| w.set_line(RTC::EXTI_WAKEUP_LINE, true));
+        assert!(self.stop_time.borrow(cs).replace(Some(self.instant())).is_none())
     }
 
     #[cfg(feature = "low-power")]
     /// stop the wakeup alarm and return the time elapsed since `start_wakeup_alarm`
     /// was called, otherwise none
-    pub(crate) fn stop_wakeup_alarm(&self) -> Option<embassy_time::Duration> {
+    pub(crate) fn stop_wakeup_alarm(&self, cs: critical_section::CriticalSection) -> Option<embassy_time::Duration> {
         use crate::interrupt::typelevel::Interrupt;
 
         trace!("rtc: stop wakeup alarm at {}", self.instant());
@@ -137,13 +135,23 @@ impl super::Rtc {
             <RTC as crate::rtc::sealed::Instance>::WakeupInterrupt::unpend();
         });
 
-        critical_section::with(|cs| {
-            if let Some(stop_time) = self.stop_time.borrow(cs).take() {
-                Some(self.instant() - stop_time)
-            } else {
-                None
-            }
-        })
+        if let Some(stop_time) = self.stop_time.borrow(cs).take() {
+            Some(self.instant() - stop_time)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "low-power")]
+    pub(crate) fn enable_wakeup_line(&self) {
+        use crate::interrupt::typelevel::Interrupt;
+        use crate::pac::EXTI;
+
+        <RTC as crate::rtc::sealed::Instance>::WakeupInterrupt::unpend();
+        unsafe { <RTC as crate::rtc::sealed::Instance>::WakeupInterrupt::enable() };
+
+        EXTI.rtsr(0).modify(|w| w.set_line(RTC::EXTI_WAKEUP_LINE, true));
+        EXTI.imr(0).modify(|w| w.set_line(RTC::EXTI_WAKEUP_LINE, true));
     }
 
     /// Applies the RTC config
